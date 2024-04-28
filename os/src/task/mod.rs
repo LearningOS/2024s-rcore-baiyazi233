@@ -14,14 +14,16 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::config::MAX_APP_NUM;
+
+use crate::config::{MAX_APP_NUM,MAX_SYSCALL_NUM};
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_us;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
-
 pub use context::TaskContext;
+pub use crate::syscall::TaskInfo;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -45,6 +47,8 @@ pub struct TaskManagerInner {
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    /// record task status
+    task_infos: [TaskInfo; MAX_APP_NUM],
 }
 
 lazy_static! {
@@ -55,16 +59,23 @@ lazy_static! {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
         }; MAX_APP_NUM];
+        let task_infos = [TaskInfo {
+            status: TaskStatus::Running,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            time: 0,
+        }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
         }
+
         TaskManager {
             num_app,
             inner: unsafe {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    task_infos,
                 })
             },
         }
@@ -81,6 +92,8 @@ impl TaskManager {
         let task0 = &mut inner.tasks[0];
         task0.task_status = TaskStatus::Running;
         let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
+        //获取第一次时间调用时间
+        inner.task_infos[0].time = get_time_us();
         drop(inner);
         let mut _unused = TaskContext::zero_init();
         // before this, we should drop local variables that must be dropped manually
@@ -125,6 +138,10 @@ impl TaskManager {
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+            //获取第一次时间调用时间
+            if inner.task_infos[current].time == 0 {
+                inner.task_infos[current].time = get_time_us();
+            }
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
             unsafe {
@@ -135,6 +152,23 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    /// update taskinfo
+    fn update_taskinfo(&self, id: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.task_infos[current].syscall_times[id] += 1;
+        drop(inner);
+        0
+    }
+
+    /// get taskinfo
+    fn get_taskinfo(&self) -> TaskInfo {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.task_infos[current].clone()
+    }
+
 }
 
 /// Run the first task in task list.
@@ -168,4 +202,13 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// update taskinfo
+pub fn update_taskinfo(id: usize) -> isize{
+    TASK_MANAGER.update_taskinfo(id)
+}
+/// get taskinfo
+pub fn get_taskinfo() -> TaskInfo{
+    TASK_MANAGER.get_taskinfo()
 }
