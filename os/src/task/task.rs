@@ -5,7 +5,7 @@ use crate::mm::{
     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
 };
 use crate::trap::{trap_handler, TrapContext};
-
+pub use crate::syscall::TaskInfo;
 /// The task control block (TCB) of a task.
 pub struct TaskControlBlock {
     /// Save task context
@@ -28,6 +28,9 @@ pub struct TaskControlBlock {
 
     /// Program break
     pub program_brk: usize,
+
+    /// record task status
+    pub task_info: TaskInfo,
 }
 
 impl TaskControlBlock {
@@ -35,26 +38,43 @@ impl TaskControlBlock {
     pub fn get_trap_cx(&self) -> &'static mut TrapContext {
         self.trap_cx_ppn.get_mut()
     }
+
     /// get the user token
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
     }
+
+    /// 添加一个逻辑段到应用地址空间
+    pub fn add_maparea(&mut self, start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission) {
+        self.memory_set.insert_framed_area(start_va, end_va, permission);
+    }
+
+    /// 删除应用地址空间的一个逻辑段
+    pub fn remove_maparea(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        self.memory_set.remove_framed_area(start_va, end_va)
+    }
+
     /// Based on the elf info in program, build the contents of task in a new address space
     pub fn new(elf_data: &[u8], app_id: usize) -> Self {
         // memory_set with elf program headers/trampoline/trap context/user stack
+        // 解析传入的 ELF 格式数据构造应用的地址空间 memory_set 并获得其他信息
         let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        // 找到应用地址空间中的 Trap 上下文实际被放在哪个物理页帧
         let trap_cx_ppn = memory_set
             .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
             .unwrap()
             .ppn();
         let task_status = TaskStatus::Ready;
         // map a kernel-stack in kernel space
+        // 找到应用的内核栈预计放在内核地址空间 KERNEL_SPACE 中的哪个位置
         let (kernel_stack_bottom, kernel_stack_top) = kernel_stack_position(app_id);
+        // 将这个逻辑段加入到内核地址空间
         KERNEL_SPACE.exclusive_access().insert_framed_area(
             kernel_stack_bottom.into(),
             kernel_stack_top.into(),
             MapPermission::R | MapPermission::W,
         );
+
         let task_control_block = Self {
             task_status,
             task_cx: TaskContext::goto_trap_return(kernel_stack_top),
@@ -63,8 +83,10 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
+            task_info: TaskInfo::new()
         };
         // prepare TrapContext in user space
+        // 初始化该应用的 Trap 上下文
         let trap_cx = task_control_block.get_trap_cx();
         *trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -75,6 +97,7 @@ impl TaskControlBlock {
         );
         task_control_block
     }
+
     /// change the location of the program break. return None if failed.
     pub fn change_program_brk(&mut self, size: i32) -> Option<usize> {
         let old_break = self.program_brk;

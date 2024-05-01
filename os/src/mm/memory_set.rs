@@ -27,7 +27,7 @@ extern "C" {
     fn ekernel();
     fn strampoline();
 }
-
+//创建内核地址空间的全局实例
 lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
     pub static ref KERNEL_SPACE: Arc<UPSafeCell<MemorySet>> =
@@ -47,11 +47,14 @@ impl MemorySet {
             areas: Vec::new(),
         }
     }
+
     /// Get the page table token
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
+
     /// Assume that no conflicts.
+    /// 在内存集中添加一个新的帧映射区域
     pub fn insert_framed_area(
         &mut self,
         start_va: VirtAddr,
@@ -63,14 +66,37 @@ impl MemorySet {
             None,
         );
     }
+
+    // 在内存集中添加一个新的映射区域
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
+        // 将映射区域映射到物理页面
         map_area.map(&mut self.page_table);
+        // 如果有数据，将数据复制到映射区域中
         if let Some(data) = data {
             map_area.copy_data(&mut self.page_table, data);
         }
+        // 将映射区域添加到内存集中
         self.areas.push(map_area);
     }
+
+    /// 在内存集中清空映射区域
+    pub fn remove_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        // 遍历所有映射区域
+        let mut index = 0;
+        while index < self.areas.len() {
+            let area = &mut self.areas[index];
+            if area.vpn_range.get_start() == start_va.floor() && area.vpn_range.get_end() == end_va.ceil() {
+                area.unmap(&mut self.page_table); // 解除映射
+                self.areas.remove(index); // 移除映射区域
+                return 0;
+            }
+            index += 1;
+        }
+        return -1;
+    }
+
     /// Mention that trampoline is not collected by areas.
+    /// 映射trampoline
     fn map_trampoline(&mut self) {
         self.page_table.map(
             VirtAddr::from(TRAMPOLINE).into(),
@@ -78,11 +104,13 @@ impl MemorySet {
             PTEFlags::R | PTEFlags::X,
         );
     }
+
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
+
         // map kernel sections
         info!(".text [{:#x}, {:#x})", stext as usize, etext as usize);
         info!(".rodata [{:#x}, {:#x})", srodata as usize, erodata as usize);
@@ -91,6 +119,7 @@ impl MemorySet {
             ".bss [{:#x}, {:#x})",
             sbss_with_stack as usize, ebss as usize
         );
+
         info!("mapping .text section");
         memory_set.push(
             MapArea::new(
@@ -101,6 +130,7 @@ impl MemorySet {
             ),
             None,
         );
+
         info!("mapping .rodata section");
         memory_set.push(
             MapArea::new(
@@ -111,6 +141,7 @@ impl MemorySet {
             ),
             None,
         );
+
         info!("mapping .data section");
         memory_set.push(
             MapArea::new(
@@ -121,6 +152,7 @@ impl MemorySet {
             ),
             None,
         );
+
         info!("mapping .bss section");
         memory_set.push(
             MapArea::new(
@@ -131,6 +163,7 @@ impl MemorySet {
             ),
             None,
         );
+
         info!("mapping physical memory");
         memory_set.push(
             MapArea::new(
@@ -141,26 +174,38 @@ impl MemorySet {
             ),
             None,
         );
+        
         memory_set
     }
+    
     /// Include sections in elf and trampoline and TrapContext and user stack,
     /// also returns user_sp_base and entry point.
+    /// 从给定的 ELF 文件数据创建一个用户模式的地址空间
     pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
         let mut memory_set = Self::new_bare();
+        
         // map trampoline
         memory_set.map_trampoline();
+        
         // map program headers of elf, with U flag
+        // 使用 xmas_elf 库解析 ELF 文件，检查其魔数是否正确，确认文件格式有效性。
         let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
+        // 遍历 ELF 文件中的所有程序头，只处理类型为 Load 的段
+        // 获取程序头的数量
         let ph_count = elf_header.pt2.ph_count();
+        // 初始化最大结束虚拟页面编号
         let mut max_end_vpn = VirtPageNum(0);
+        // 遍历所有程序头
         for i in 0..ph_count {
             let ph = elf.program_header(i).unwrap();
             if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+                
                 let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
+                // 根据程序头的标志位设置映射权限
                 let mut map_perm = MapPermission::U;
                 let ph_flags = ph.flags();
                 if ph_flags.is_read() {
@@ -172,18 +217,25 @@ impl MemorySet {
                 if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
+                // 创建和推送内存区域
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
+                // 更新最大结束虚拟页面编号
                 max_end_vpn = map_area.vpn_range.get_end();
+                // 将 ELF 文件中的数据复制到映射区域中
                 memory_set.push(
                     map_area,
                     Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
                 );
             }
         }
+
+        // 映射用户栈
         // map user stack with U flags
+        // 将之前所有映射区域中最高的虚拟页面编号,作为用户栈底部的起始地址
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_bottom: usize = max_end_va.into();
         // guard page
+        // 设置保护页
         user_stack_bottom += PAGE_SIZE;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
         memory_set.push(
@@ -195,7 +247,9 @@ impl MemorySet {
             ),
             None,
         );
+        
         // used in sbrk
+        // 动态内存分配
         memory_set.push(
             MapArea::new(
                 user_stack_top.into(),
@@ -205,6 +259,7 @@ impl MemorySet {
             ),
             None,
         );
+        
         // map TrapContext
         memory_set.push(
             MapArea::new(
@@ -215,13 +270,16 @@ impl MemorySet {
             ),
             None,
         );
+        // 返回构建好的 MemorySet 实例、用户栈顶地址和 ELF 文件定义的入口点地址
         (
             memory_set,
             user_stack_top,
             elf.header.pt2.entry_point() as usize,
         )
     }
+    
     /// Change page table by writing satp CSR Register.
+    /// 启动 SV39 分页模式
     pub fn activate(&self) {
         let satp = self.page_table.token();
         unsafe {
@@ -229,10 +287,12 @@ impl MemorySet {
             asm!("sfence.vma");
         }
     }
+    
     /// Translate a virtual page number to a page table entry
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
@@ -262,6 +322,17 @@ impl MemorySet {
             false
         }
     }
+
+    /// 检测新的映射区域是否与已有的映射区域冲突
+    pub fn check_conflict(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        // any: 如果任意一个元素满足条件，则返回true
+        self.areas.iter().any(|area| {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            (start.floor() >= area_start && start.floor() < area_end) || (end.ceil() > area_start && end.ceil() <= area_end)
+        })
+    }
+
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -272,6 +343,7 @@ pub struct MapArea {
 }
 
 impl MapArea {
+    /// 新建逻辑段
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,
@@ -287,12 +359,15 @@ impl MapArea {
             map_perm,
         }
     }
+    /// 将一个虚拟页面映射到物理页面
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
+            // 物理页面编号与虚拟页面编号相同
             MapType::Identical => {
                 ppn = PhysPageNum(vpn.0);
             }
+            // 分配一个新的物理帧并更新data_frames映射
             MapType::Framed => {
                 let frame = frame_alloc().unwrap();
                 ppn = frame.ppn;
@@ -303,24 +378,29 @@ impl MapArea {
         page_table.map(vpn, ppn, pte_flags);
     }
     #[allow(unused)]
+    /// 解除一个虚拟页面的映射
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        // 如果是Framed类型的映射，需要释放物理帧
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
         }
         page_table.unmap(vpn);
     }
+    /// 将整个虚拟区域映射到物理页面
     pub fn map(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
     }
     #[allow(unused)]
+    /// 解除整个虚拟区域的映射
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
         }
     }
     #[allow(unused)]
+    /// 缩小虚拟区域到new_end
     pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
             self.unmap_one(page_table, vpn)
@@ -328,6 +408,7 @@ impl MapArea {
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
     #[allow(unused)]
+    /// 扩展虚拟区域到new_end
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
             self.map_one(page_table, vpn)
@@ -336,32 +417,43 @@ impl MapArea {
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
+    /// 将数据复制到映射区域中
     pub fn copy_data(&mut self, page_table: &mut PageTable, data: &[u8]) {
         assert_eq!(self.map_type, MapType::Framed);
+        // 从start开始，每次复制一个页面的数据
         let mut start: usize = 0;
         let mut current_vpn = self.vpn_range.get_start();
+        // 输入数据的总长度
         let len = data.len();
+        // 逐页复制数据
         loop {
+            // 切片的大小为PAGE_SIZE或剩余数据的大小（如果小于一页）
             let src = &data[start..len.min(start + PAGE_SIZE)];
+            
             let dst = &mut page_table
                 .translate(current_vpn)
                 .unwrap()
                 .ppn()
                 .get_bytes_array()[..src.len()];
+
             dst.copy_from_slice(src);
             start += PAGE_SIZE;
             if start >= len {
                 break;
             }
+            // 页号加一
             current_vpn.step();
         }
     }
+
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 /// map type for memory set: identical or framed
 pub enum MapType {
+    /// 直接映射
     Identical,
+    /// 随机映射
     Framed,
 }
 
@@ -380,7 +472,9 @@ bitflags! {
 }
 
 /// Return (bottom, top) of a kernel stack in kernel space.
+/// 计算并返回给定应用或进程的内核栈在内核空间中的位置
 pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
+    //偏移量是 app_id 乘以每个栈的总大小 (KERNEL_STACK_SIZE + PAGE_SIZE)，PAGE_SIZE是保护页
     let top = TRAMPOLINE - app_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
     let bottom = top - KERNEL_STACK_SIZE;
     (bottom, top)

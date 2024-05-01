@@ -21,8 +21,9 @@ use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
-
+use crate::mm::{VirtAddr, MapPermission};
 pub use context::TaskContext;
+pub use crate::syscall::TaskInfo;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -46,6 +47,7 @@ struct TaskManagerInner {
     tasks: Vec<TaskControlBlock>,
     /// id of current `Running` task
     current_task: usize,
+
 }
 
 lazy_static! {
@@ -126,6 +128,27 @@ impl TaskManager {
         inner.tasks[inner.current_task].get_trap_cx()
     }
 
+    /// 添加一个逻辑段到应用地址空间
+    pub fn add_maparea(&self, start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission){
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].add_maparea(start_va, end_va, permission);
+    }
+
+    /// 删除应用地址空间的一个逻辑段
+    pub fn remove_maparea(&self, start_va: VirtAddr, end_va: VirtAddr) -> isize{
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].remove_maparea(start_va, end_va)
+    }
+
+    /// 检测新的映射区域是否与已有的映射区域冲突
+    pub fn check_maparea(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.check_conflict(start_va, end_va)
+    }
+
     /// Change the current 'Running' task's program break
     pub fn change_current_program_brk(&self, size: i32) -> Option<usize> {
         let mut inner = self.inner.exclusive_access();
@@ -153,6 +176,22 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    /// update taskinfo
+    fn update_taskinfo(&self, id: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].task_info.syscall_times[id] += 1;
+        0
+    }
+
+    /// get taskinfo
+    fn get_taskinfo(&self) -> TaskInfo {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].task_info.clone()
+    }
+
 }
 
 /// Run the first task in task list.
@@ -201,4 +240,29 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// 添加一个逻辑段到应用地址空间
+pub fn add_maparea(start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission){
+    TASK_MANAGER.add_maparea(start_va, end_va, permission);
+}
+
+/// 删除应用地址空间的一个逻辑段
+pub fn remove_maparea(start_va: VirtAddr, end_va: VirtAddr) -> isize{
+    TASK_MANAGER.remove_maparea(start_va, end_va)
+}
+
+/// update taskinfo
+pub fn update_taskinfo(id: usize) -> isize {
+    TASK_MANAGER.update_taskinfo(id)
+}
+
+/// get taskinfo
+pub fn get_taskinfo() -> TaskInfo {
+    TASK_MANAGER.get_taskinfo()
+}
+
+/// 检测新的映射区域是否与已有的映射区域冲突
+pub fn check_maparea(start_va: VirtAddr, end_va: VirtAddr) -> bool {
+    TASK_MANAGER.check_maparea(start_va, end_va)
 }
