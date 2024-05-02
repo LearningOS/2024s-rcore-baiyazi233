@@ -38,6 +38,7 @@ pub use processor::{
 /// Suspend the current 'Running' task and run the next task in task list.
 pub fn suspend_current_and_run_next() {
     // There must be an application running.
+    // 取出当前正在执行的任务，修改其进程控制块内的状态
     let task = take_current_task().unwrap();
 
     // ---- access current TCB exclusively
@@ -49,10 +50,12 @@ pub fn suspend_current_and_run_next() {
     // ---- release current PCB
 
     // push back to ready queue.
+    // 将这个任务放入任务管理器的队尾
     add_task(task);
     // jump to scheduling cycle
+    // 调度并切换任务
     schedule(task_cx_ptr);
-}
+}//当仅有一个任务的时候， suspend_current_and_run_next 的效果是会继续执行这个任务
 
 /// pid of usertests app in make run TEST=1
 pub const IDLE_PID: usize = 0;

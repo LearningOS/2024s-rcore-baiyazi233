@@ -13,14 +13,18 @@ use alloc::sync::Arc;
 use lazy_static::*;
 
 /// Processor management structure
+/// 存放所有在运行过程中可能变化的内容
 pub struct Processor {
     ///The task currently executing on the current processor
+    /// 当前处理器上正在执行的任务
     current: Option<Arc<TaskControlBlock>>,
 
     ///The basic control flow of each core, helping to select and switch process
+    /// 当前处理器上的 idle 控制流的任务上下文
     idle_task_cx: TaskContext,
 }
 
+/// 描述CPU 执行状态 的数据结构
 impl Processor {
     ///Create an empty Processor
     pub fn new() -> Self {
@@ -36,11 +40,13 @@ impl Processor {
     }
 
     ///Get current task in moving semanteme
+    /// 可以取出当前正在执行的任务
     pub fn take_current(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.current.take()
     }
 
     ///Get current task in cloning semanteme
+    /// 返回当前执行的任务的一份拷贝
     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
         self.current.as_ref().map(Arc::clone)
     }
@@ -52,13 +58,19 @@ lazy_static! {
 
 ///The main part of process execution and scheduling
 ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
+/// 负责进程的执行和调度
 pub fn run_tasks() {
+    // 持续检查并切换到就绪的任务
     loop {
+        // 获取处理器访问权
         let mut processor = PROCESSOR.exclusive_access();
+        // 获取下一个要执行的任务
         if let Some(task) = fetch_task() {
+            // 得到 __switch 的第一个参数，也就是当前 idle 控制流的 task_cx_ptr
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.inner_exclusive_access();
+            // 获取下一个要运行的任务的上下文指针,__switch 的第二个参数
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
             // release coming task_inner manually

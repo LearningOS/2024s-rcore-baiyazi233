@@ -18,10 +18,12 @@ impl TaskManager {
         }
     }
     /// Add process back to ready queue
+    /// 添加任务
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
     /// Take a process out of the ready queue
+    /// 获取任务
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.ready_queue.pop_front()
     }

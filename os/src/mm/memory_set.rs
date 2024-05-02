@@ -234,15 +234,19 @@ impl MemorySet {
         )
     }
     /// Create a new address space by copy code&data from a exited process's address space.
+    /// 复制一个完全相同的地址空间
     pub fn from_existed_user(user_space: &Self) -> Self {
+        // 创建一个空的地址空间
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
         // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
+            // 逻辑段复制
             let new_area = MapArea::from_another(area);
             memory_set.push(new_area, None);
             // copy data from another space
+            // 数据复制
             for vpn in area.vpn_range {
                 let src_ppn = user_space.translate(vpn).unwrap().ppn();
                 let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
@@ -325,6 +329,8 @@ impl MapArea {
             map_perm,
         }
     }
+    /// 可以从一个逻辑段复制得到一个虚拟地址区间、映射方式和权限控制均相同的逻辑段
+    /// 由于它还没有真正被映射到物理页帧上，所以 data_frames 字段为空
     pub fn from_another(another: &Self) -> Self {
         Self {
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
@@ -333,6 +339,7 @@ impl MapArea {
             map_perm: another.map_perm,
         }
     }
+
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
@@ -348,6 +355,7 @@ impl MapArea {
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
+
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
