@@ -4,29 +4,47 @@ use alloc::sync::Arc;
 use crate::{
     config::MAX_SYSCALL_NUM,
     loader::get_app_data_by_name,
-    mm::{translated_refmut, translated_str},
+    mm::{VirtAddr, MapPermission, translated_refmut, translated_str},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next, TaskStatus,
+        suspend_current_and_run_next, TaskStatus, add_maparea, remove_maparea,
+        get_taskinfo, check_maparea, take_current_task, set_current,
     },
+    timer::get_time_us,
 };
 
 #[repr(C)]
 #[derive(Debug)]
+/// Time value
 pub struct TimeVal {
+    /// Second
     pub sec: usize,
+    /// Microsecond
     pub usec: usize,
 }
 
 /// Task information
 #[allow(dead_code)]
+#[derive(Copy, Clone)]
 pub struct TaskInfo {
     /// Task status in it's life cycle
-    status: TaskStatus,
+    pub status: TaskStatus,
     /// The numbers of syscall called by task
-    syscall_times: [u32; MAX_SYSCALL_NUM],
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
     /// Total running time of task
-    time: usize,
+    pub time: usize,
+}
+
+#[allow(dead_code)]
+impl TaskInfo {
+    /// Create a new TaskInfo
+    pub fn new() -> Self {
+        TaskInfo {
+            status: TaskStatus::Running,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            time: get_time_us(),
+        }
+    }
 }
 
 /// task exits and submit an exit code
@@ -43,11 +61,13 @@ pub fn sys_yield() -> isize {
     0
 }
 
+/// get current task pid
 pub fn sys_getpid() -> isize {
     trace!("kernel: sys_getpid pid:{}", current_task().unwrap().pid.0);
     current_task().unwrap().pid.0 as isize
 }
 
+/// fork current task
 pub fn sys_fork() -> isize {
     trace!("kernel:pid[{}] sys_fork", current_task().unwrap().pid.0);
     let current_task = current_task().unwrap();
@@ -63,6 +83,7 @@ pub fn sys_fork() -> isize {
     new_pid as isize
 }
 
+/// exec
 pub fn sys_exec(path: *const u8) -> isize {
     trace!("kernel:pid[{}] sys_exec", current_task().unwrap().pid.0);
     let token = current_user_token();
@@ -122,7 +143,13 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let us = get_time_us();
+    let ts = translated_refmut(current_user_token(), _ts);
+    *ts = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    0
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
@@ -133,7 +160,14 @@ pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
         "kernel:pid[{}] sys_task_info NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let ti = translated_refmut(current_user_token(), _ti);
+    let task_ref = get_taskinfo();
+    *ti = TaskInfo {
+        status: TaskStatus::Running,
+        syscall_times: task_ref.syscall_times,
+        time: (get_time_us() - task_ref.time) / 1000,
+    };
+    0
 }
 
 /// YOUR JOB: Implement mmap.
@@ -142,16 +176,52 @@ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
         "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    if _len == 0 {
+        return 0;
+    }
+    if _port & !0x7 != 0 || _port & 0x7 == 0 {
+        return -1;
+    }
+    let _end = _start + _len;
+    let start_va = VirtAddr::from(_start);
+    if !start_va.aligned() {
+        debug!("unmap fail don't aligned");
+        return -1;
+    }
+    let end_va = VirtAddr::from(_end);
+    if check_maparea(start_va, end_va) {
+        debug!("unmap fail conflict");
+        return -1;
+    }
+    let mut map_perm = MapPermission::U;
+    if 1 as usize & _port != 0 {
+        map_perm |= MapPermission::R;
+    }
+    if 2 as usize & _port != 0 {
+        map_perm |= MapPermission::W;
+    }
+    if 4 as usize & _port != 0 {
+        map_perm |= MapPermission::X;
+    }
+    add_maparea(start_va, end_va, map_perm);
+    0
 }
 
 /// YOUR JOB: Implement munmap.
+#[allow(unreachable_code)]
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let _end = _start + _len;
+    let start_va = VirtAddr::from(_start);
+    if !start_va.aligned() {
+        debug!("unmap fail don't aligned");
+        return -1;
+    }
+    let end_va = VirtAddr::from(_end);
+    remove_maparea(start_va, end_va)
 }
 
 /// change data segment size
@@ -171,14 +241,35 @@ pub fn sys_spawn(_path: *const u8) -> isize {
         "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let token = current_user_token();
+    let _path = translated_str(token, _path);
+    if let Some(data) = get_app_data_by_name(_path.as_str()) {
+        let current_task = current_task().unwrap();
+        let new_task = current_task.spawn(data);
+        let new_pid = new_task.pid.0;
+        let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
+        trap_cx.x[10] = 0;
+        add_task(new_task);
+        return new_pid as isize;
+    } else {
+        return -1;
+    }
+
 }
 
-// YOUR JOB: Set task priority.
+/// YOUR JOB: Set task priority.
 pub fn sys_set_priority(_prio: isize) -> isize {
     trace!(
         "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    if _prio < 2 {
+        return -1;
+    }
+    let task = take_current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.pro_lev = _prio as usize;
+    drop(inner);
+    set_current(task);
+    _prio
 }
