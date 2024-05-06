@@ -17,6 +17,7 @@ use lazy_static::*;
 /// inode in memory
 /// A wrapper around a filesystem inode
 /// to implement File trait atop
+/// 内核将 easy-fs 提供的 Inode 进一步封装为 OS 中的索引节点 OSInode
 pub struct OSInode {
     readable: bool,
     writable: bool,
@@ -52,9 +53,22 @@ impl OSInode {
         }
         v
     }
+
+    /// get current node id
+    pub fn get_inode_id(&self) -> u64 {
+        let inner = self.inner.exclusive_access();
+        inner.inode.block_id as u64
+    }
+    /// get inode 'block_id' and 'block_offset'
+    pub fn get_inode_pos(&self) -> (usize, usize) {
+        let inner = self.inner.exclusive_access();
+        (inner.inode.block_id, inner.inode.block_offset)
+    }
 }
 
+// 需要从块设备 BLOCK_DEVICE 上打开文件系统，并从文件系统中获取根目录的 inode
 lazy_static! {
+    /// The root inode of the filesystem
     pub static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
@@ -123,7 +137,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         })
     }
 }
-
+/// OSInode 也是要一种要放到进程文件描述符表中，通过 sys_read/write 进行读写的文件
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
@@ -134,6 +148,7 @@ impl File for OSInode {
     fn read(&self, mut buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
         let mut total_read_size = 0usize;
+        // 遍历 buf 中的每一个 slice
         for slice in buf.buffers.iter_mut() {
             let read_size = inner.inode.read_at(inner.offset, *slice);
             if read_size == 0 {

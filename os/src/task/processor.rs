@@ -44,6 +44,12 @@ impl Processor {
     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
         self.current.as_ref().map(Arc::clone)
     }
+
+    ///Set current task
+    pub fn set_current(&mut self, task: Arc<TaskControlBlock>) {
+        self.current = Some(task);
+    }
+
 }
 
 lazy_static! {
@@ -98,6 +104,11 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
         .unwrap()
         .inner_exclusive_access()
         .get_trap_cx()
+}
+
+/// Set current task
+pub fn set_current(task: Arc<TaskControlBlock>) {
+    PROCESSOR.exclusive_access().current = Some(task);
 }
 
 ///Return to idle control flow for new scheduling

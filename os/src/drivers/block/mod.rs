@@ -10,6 +10,7 @@ use lazy_static::*;
 
 type BlockDeviceImpl = virtio_blk::VirtIOBlock;
 
+// 在 qemu 上，我们使用 VirtIOBlock 访问 VirtIO 块设备，并将它全局实例化为 BLOCK_DEVICE ，使内核的其他模块可以访问。
 lazy_static! {
     /// The global block device driver instance: BLOCK_DEVICE with BlockDevice trait
     pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(BlockDeviceImpl::new());

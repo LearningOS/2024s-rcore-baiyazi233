@@ -3,14 +3,14 @@ use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE, MapPermission};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
-
+use crate::syscall::TaskInfo;
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -64,6 +64,12 @@ pub struct TaskControlBlockInner {
 
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
+
+    /// 文件描述符表 ，记录所有它请求内核打开并可以读写的那些文件集合
+    /// Vec 的动态长度特性使得我们无需设置一个固定的文件描述符数量上限
+    /// Option 使得我们可以区分一个文件描述符当前是否空闲，当它是 None 的时候是空闲的，而 Some 则代表它已被占用
+    /// Arc 首先提供了共享引用能力，此外被它包裹的内容会被放到内核堆而不是栈上，于是它便不需要在编译期有着确定的大小
+    /// dyn 关键字表明 Arc 里面的类型实现了 File/Send/Sync 三个 Trait，需要等到运行时才能知道它的具体类型
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
 
     /// Heap bottom
@@ -71,6 +77,15 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// record task status
+    pub task_info: TaskInfo,
+
+    /// 当前 stride
+    pub cur_stride: usize,
+
+    /// 优先级等级
+    pub pro_lev: usize,
 }
 
 impl TaskControlBlockInner {
@@ -94,6 +109,32 @@ impl TaskControlBlockInner {
             self.fd_table.len() - 1
         }
     }
+
+     /// 添加一个逻辑段到应用地址空间
+     pub fn add_maparea(&mut self, start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission) {
+        self.memory_set.insert_framed_area(start_va, end_va, permission);
+    }
+    /// 删除应用地址空间的一个逻辑段
+    pub fn remove_maparea(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        self.memory_set.remove_framed_area(start_va, end_va)
+    }
+
+    /// 检测新的映射区域是否与已有的映射区域冲突
+    pub fn check_maparea(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        self.memory_set.check_conflict(start_va, end_va)
+    }
+
+    /// update taskinfo
+    pub fn update_taskinfo(&mut self, id: usize) -> isize {
+        self.task_info.syscall_times[id] += 1;
+        0
+    }
+
+    /// get taskinfo
+    pub fn get_taskinfo(&self) -> TaskInfo {
+        self.task_info.clone()
+    }
+
 }
 
 impl TaskControlBlock {
@@ -125,6 +166,7 @@ impl TaskControlBlock {
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
+                    // 为进程打开标准输入文件和标准输出文件
                     fd_table: vec![
                         // 0 -> stdin
                         Some(Arc::new(Stdin)),
@@ -135,6 +177,9 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    task_info: TaskInfo::new(),
+                    cur_stride: 0,
+                    pro_lev: 16,
                 })
             },
         };
@@ -216,6 +261,9 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    task_info: TaskInfo::new(),
+                    cur_stride: 0,
+                    pro_lev: 16,
                 })
             },
         });
@@ -261,6 +309,73 @@ impl TaskControlBlock {
             None
         }
     }
+
+    /// spawn
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        // ---- access parent PCB exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+        // copy user space(include trap context)
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        // copy fd table
+        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+        for fd in parent_inner.fd_table.iter() {
+            if let Some(file) = fd {
+                new_fd_table.push(Some(file.clone()));
+            } else {
+                new_fd_table.push(None);
+            }
+        }
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,  
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),  //将父进程的弱引用计数放到子进程的进程控制块中
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: new_fd_table,
+                    heap_bottom: parent_inner.heap_bottom,
+                    program_brk: parent_inner.program_brk,
+                    task_info: TaskInfo::new(),
+                    cur_stride: 0,
+                    pro_lev: 16,
+                })
+            },
+        });
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        // add child
+        // 将子进程插入到父进程的孩子向量
+        parent_inner.children.push(task_control_block.clone());
+        // modify kernel_sp in trap_cx
+        // **** access child PCB exclusively
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        trap_cx.kernel_sp = kernel_stack_top;
+        // return
+        task_control_block
+        // **** release child PCB
+        // ---- release parent PCB
+    }
+
 }
 
 #[derive(Copy, Clone, PartialEq)]
